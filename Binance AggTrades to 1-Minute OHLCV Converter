@@ -44,3 +44,96 @@ Quantitative Research
 Volume Analysis
 Machine Learning Data Preparation
 Cryptocurrency Market Analysis
+
+
+
+1. Конвертер сделок Binance в минутные свечи
+Описание
+
+Данный проект предназначен для преобразования исторических данных Binance AggTrades в полноценные минутные свечи (OHLCV) с дополнительными рыночными метриками.
+
+Скрипт автоматически обрабатывает неограниченное количество CSV-файлов с историей сделок, объединяет их и формирует единый датасет минутных свечей, который может использоваться для построения торговых стратегий, бэктестинга, машинного обучения и анализа рынка.
+
+Основные возможности
+Автоматический поиск всех файлов AggTrades.
+Обработка большого объема исторических данных.
+Построение минутных OHLC-свечей.
+Расчет общего торгового объема.
+Разделение объема покупателей и продавцов.
+Расчет Delta Volume (Buy Volume − Sell Volume).
+Подсчет количества сделок в каждой минуте.
+Объединение нескольких файлов в единый датасет.
+Сортировка данных по времени.
+Экспорт результата в CSV.
+Выходные данные
+
+Для каждой минутной свечи рассчитываются:
+
+Timestamp
+Open
+High
+Low
+Close
+Total Volume
+Buy Volume
+Sell Volume
+Delta Volume
+Number of Trades
+Используемые технологии
+Python
+Pandas
+CSV Processing
+Time Series Processing
+Market Data Analysis
+Область применения
+Построение торговых стратегий
+Бэктестинг
+Анализ рыночной активности
+Исследование объемов
+Подготовка данных для Machine Learning
+Алгоритмический трейдинг
+
+
+import pandas as pd
+import glob
+import os
+
+OUTPUT_CSV = "candles_1m_all.csv"
+
+files = glob.glob(os.path.join(os.path.dirname(__file__), "*aggTrades*.csv"))
+if not files:
+    print("❌ Файлы aggTrades не найдены!")
+    exit()
+print(f"📂 Найдено файлов: {len(files)}")
+all_candles = []
+for file in sorted(files):
+    print(f"⏳ Обрабатываю: {os.path.basename(file)}")
+    df = pd.read_csv(file)
+    df["price"] = df["price"].astype(float)
+    df["quantity"] = df["quantity"].astype(float)
+    df["buy_qty"] = df.apply(
+        lambda x: x["quantity"] if not x["is_buyer_maker"] else 0, axis=1
+    )
+    df["sell_qty"] = df.apply(
+        lambda x: x["quantity"] if x["is_buyer_maker"] else 0, axis=1
+    )
+    df["timestamp"] = pd.to_datetime(df["transact_time"], unit="ms")
+    df = df.set_index("timestamp")
+    candles = pd.DataFrame()
+    candles["open"]         = df["price"].resample("1min").first()
+    candles["high"]         = df["price"].resample("1min").max()
+    candles["low"]          = df["price"].resample("1min").min()
+    candles["close"]        = df["price"].resample("1min").last()
+    candles["volume"]       = df["quantity"].resample("1min").sum()
+    candles["buy_volume"]   = df["buy_qty"].resample("1min").sum()
+    candles["sell_volume"]  = df["sell_qty"].resample("1min").sum()
+    candles["delta"]        = candles["buy_volume"] - candles["sell_volume"]
+    candles["trades_count"] = df["price"].resample("1min").count()
+    candles = candles.dropna().reset_index()  
+    all_candles.append(candles)
+final = pd.concat(all_candles).sort_values("timestamp").reset_index(drop=True)
+final.to_csv(OUTPUT_CSV, index=False)
+print(f"Готово: {OUTPUT_CSV} ({len(final)} строк)")
+print(final.head())
+
+
