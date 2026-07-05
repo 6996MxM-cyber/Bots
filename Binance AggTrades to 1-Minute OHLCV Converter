@@ -1,0 +1,46 @@
+1. Binance AggTrades to 1-Minute OHLCV Converter
+Description
+
+This project converts raw Binance AggTrades historical data into complete 1-minute OHLCV candles enriched with additional market statistics.
+
+The application automatically processes multiple AggTrades CSV files, merges them into a unified dataset, and generates high-quality market data suitable for quantitative analysis, algorithmic trading, backtesting, and machine learning.
+
+Features
+Automatic detection of all AggTrades CSV files.
+Processing of large historical datasets.
+Generation of 1-minute OHLC candles.
+Total traded volume calculation.
+Buy volume calculation.
+Sell volume calculation.
+Delta Volume (Buy Volume − Sell Volume).
+Number of trades per minute.
+Automatic merging of multiple datasets.
+Chronological sorting of all candles.
+CSV export.
+Output Data
+
+Each generated candle contains:
+
+Timestamp
+Open
+High
+Low
+Close
+Total Volume
+Buy Volume
+Sell Volume
+Delta Volume
+Number of Trades
+Technologies
+Python
+Pandas
+CSV Processing
+Time Series Analysis
+Financial Data Processing
+Use Cases
+Algorithmic Trading
+Strategy Backtesting
+Quantitative Research
+Volume Analysis
+Machine Learning Data Preparation
+Cryptocurrency Market Analysis
