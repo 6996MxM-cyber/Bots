@@ -127,12 +127,12 @@ OUTPUT_CSV = "delta_price_positions_all.csv"
 VOLUME_THRESHOLD = 10_000_000
 files = glob.glob(os.path.join(os.path.dirname(__file__), "*aggTrades*.csv"))
 if not files:
-    print("❌ Файлы aggTrades не найдены!")
+    print(" Файлы aggTrades не найдены!")
     exit()
-print(f"📂 Найдено файлов: {len(files)}")
+print(f" Найдено файлов: {len(files)}")
 all_results = []
 for file in sorted(files):
-    print(f"⏳ Обрабатываю: {os.path.basename(file)}")    
+    print(f" Обрабатываю: {os.path.basename(file)}")    
     df = pd.read_csv(file)    
     df['timestamp'] = pd.to_datetime(df['transact_time'], unit='ms')
     df['price'] = df['price'].astype(float)
