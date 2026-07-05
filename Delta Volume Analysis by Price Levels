@@ -1,0 +1,167 @@
+Delta Volume Analysis by Price Levels
+Description
+
+This project analyzes Binance AggTrades historical data to identify the most significant price level inside every one-minute interval.
+
+For each minute, the algorithm calculates the cumulative Delta USD at every traded price level, identifies the strongest buying or selling pressure, and filters only high-volume market events.
+
+The generated dataset can be used for market microstructure analysis, liquidity research, order flow analysis, and development of algorithmic trading strategies.
+
+Features
+Automatic processing of multiple AggTrades files.
+USD value calculation for every trade.
+Delta USD calculation based on trade direction.
+Aggregation by minute and price level.
+Detection of the strongest Delta USD level.
+High-volume event filtering.
+Automatic BUY / SELL pressure classification.
+CSV export.
+Processing Workflow
+
+For every trade the application calculates:
+
+Trade value in USD.
+Trade direction.
+Delta USD.
+
+The algorithm then:
+
+Groups trades by one-minute intervals.
+Groups trades by price level inside each minute.
+Calculates cumulative Delta USD for every price level.
+Finds the price level with the largest absolute Delta USD.
+Filters only high-volume trading activity.
+Determines whether buyers or sellers dominated the market.
+Output Data
+
+Each detected event contains:
+
+Timestamp
+Price Level
+Delta USD
+Total USD Volume
+Market Side (BUY / SELL)
+Technologies
+Python
+Pandas
+Time Series Analysis
+Market Microstructure
+Order Flow Analysis
+CSV Processing
+Use Cases
+Order Flow Analysis
+Liquidity Research
+Large Trader Detection
+Trading Signal Generation
+Quantitative Trading
+Market Structure Analysis
+Algorithmic Trading
+Machine Learning Data Preparation
+
+
+
+Анализ дельты объема по ценовым уровням
+Описание
+
+Проект предназначен для анализа рыночной активности внутри каждой минутной свечи на основе исторических сделок Binance (AggTrades).
+
+Для каждой минуты алгоритм определяет ценовой уровень с максимальным абсолютным значением Delta USD, рассчитывает объем торгов и направление доминирующего рыночного давления (BUY / SELL).
+
+Подобный анализ используется при исследовании крупных участников рынка, поиске зон накопления и распределения ликвидности, а также для построения алгоритмических торговых стратегий.
+
+Основные возможности
+Автоматическая обработка нескольких файлов AggTrades.
+Расчет долларового объема каждой сделки.
+Вычисление Delta USD для каждой сделки.
+Группировка сделок по минутам и ценовым уровням.
+Поиск уровня с максимальной абсолютной дельтой.
+Фильтрация только крупных объемов.
+Определение направления рыночной инициативы (BUY / SELL).
+Объединение результатов в единый CSV-файл.
+Алгоритм работы
+
+Для каждой сделки рассчитываются:
+
+стоимость сделки в USD;
+направление сделки;
+Delta USD.
+
+После этого:
+
+сделки группируются по минутам;
+внутри каждой минуты дополнительно группируются по цене;
+для каждого ценового уровня рассчитывается суммарная Delta USD;
+выбирается уровень с максимальным абсолютным значением Delta USD;
+отбираются только минуты с объемом выше установленного порога;
+определяется направление доминирующего давления покупателей или продавцов.
+Выходные данные
+
+Для каждой найденной минуты сохраняются:
+
+Timestamp
+Price Level
+Delta USD
+Total USD Volume
+Market Side (BUY / SELL)
+Используемые технологии
+Python
+Pandas
+Time Series Analysis
+Market Microstructure
+Volume Analysis
+CSV Processing
+Область применения
+Анализ крупных участников рынка
+Исследование рыночной ликвидности
+Поиск сильных ценовых уровней
+Построение торговых сигналов
+Алгоритмический трейдинг
+Подготовка данных для количественного анализа
+
+
+import pandas as pd
+import glob
+import os
+
+OUTPUT_CSV = "delta_price_positions_all.csv"
+VOLUME_THRESHOLD = 10_000_000
+files = glob.glob(os.path.join(os.path.dirname(__file__), "*aggTrades*.csv"))
+if not files:
+    print("❌ Файлы aggTrades не найдены!")
+    exit()
+print(f"📂 Найдено файлов: {len(files)}")
+all_results = []
+for file in sorted(files):
+    print(f"⏳ Обрабатываю: {os.path.basename(file)}")    
+    df = pd.read_csv(file)    
+    df['timestamp'] = pd.to_datetime(df['transact_time'], unit='ms')
+    df['price'] = df['price'].astype(float)
+    df['qty'] = df['quantity'].astype(float)
+    df['usd'] = df['price'] * df['qty']
+    df['delta_usd'] = df.apply(
+        lambda x: x['usd'] if not x['is_buyer_maker'] else -x['usd'],
+        axis=1
+    )
+    df.set_index('timestamp', inplace=True)
+    grouped = (
+        df
+        .groupby([pd.Grouper(freq='1min'), 'price'])
+        .agg(
+            delta_usd=('delta_usd', 'sum'),
+            total_usd=('usd', 'sum')
+        )
+        .reset_index()
+    )
+    idx = grouped.groupby('timestamp')['delta_usd'].apply(
+        lambda x: x.abs().idxmax()
+    )
+    result = grouped.loc[idx].sort_values('timestamp')
+    result = result[result['total_usd'] > VOLUME_THRESHOLD]
+    result['side'] = result['delta_usd'].apply(lambda x: 'BUY' if x > 0 else 'SELL')        
+    all_results.append(result)
+# === Объединяем и сохраняем ===
+final = pd.concat(all_results).sort_values('timestamp')
+final.to_csv(OUTPUT_CSV, index=False)
+print(f"Готово: {OUTPUT_CSV} ({len(final)} строк)")
+
+
