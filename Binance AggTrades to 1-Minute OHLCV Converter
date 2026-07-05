@@ -102,12 +102,12 @@ OUTPUT_CSV = "candles_1m_all.csv"
 
 files = glob.glob(os.path.join(os.path.dirname(__file__), "*aggTrades*.csv"))
 if not files:
-    print("❌ Файлы aggTrades не найдены!")
+    print(" Файлы aggTrades не найдены!")
     exit()
-print(f"📂 Найдено файлов: {len(files)}")
+print(f" Найдено файлов: {len(files)}")
 all_candles = []
 for file in sorted(files):
-    print(f"⏳ Обрабатываю: {os.path.basename(file)}")
+    print(f" Обрабатываю: {os.path.basename(file)}")
     df = pd.read_csv(file)
     df["price"] = df["price"].astype(float)
     df["quantity"] = df["quantity"].astype(float)
