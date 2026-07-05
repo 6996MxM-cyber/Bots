@@ -1,0 +1,646 @@
+import csv
+import hmac
+import hashlib
+import os
+import time
+from datetime import datetime, timezone
+from datetime import timedelta
+from decimal import Decimal
+import pandas as pd
+import requests
+from binance.client import Client
+from binance.enums import FUTURE_ORDER_TYPE_MARKET, SIDE_BUY, SIDE_SELL
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
+LEVERAGE = 40
+RISK_PER_TRADE_PCT = 2.0              
+MIN_QTY_BTC = 0.002                   
+BALANCE_UPDATE_INTERVAL_SEC = 86400   
+MAX_OPEN_TRADES = 30
+MAX_SIGNAL_AGE_SECONDS = 181
+TRADES_FILE = "event_signals.csv"
+OPEN_TRADES_LOG = "open_trades_log.csv"
+BASE_URL = "https://fapi.binance.com"
+WORKING_TYPE = "MARK_PRICE"
+API_RECV_WINDOW_MS = 10000
+EXIT_ORDER_DELAY_SECONDS = 1
+EXIT_ORDER_RETRIES = 10
+
+API_KEY = ""
+API_SECRET = ""
+
+LONG_SYMBOL = "BTCUSDC"
+SHORT_SYMBOL = "BTCUSDT"
+client = Client(API_KEY, API_SECRET)
+SIGNAL_FIELDS = [
+    "timestamp",
+    "event_price",
+    "event_delta",
+    "total_usd",
+    "event_side",
+    "entry_price",
+    "pattern_rank",
+    "pattern_name",
+    "zone",
+    "event_filter",
+    "market_filter",
+    "signal_mode",
+    "side",
+    "hold_minutes",
+    "stop_pct",
+    "take_pct",
+    "risk_per_trade_pct",
+    "risk_position_fraction",
+    "fib_tf",
+    "fib_lookback",
+    "fib_z",
+    "fib_high",
+    "fib_low",
+    "fib_trend_pct",
+]
+OPEN_TRADE_COLUMNS = [
+    "timestamp",
+    "signal_timestamp",
+    "pattern_rank",
+    "pattern_name",
+    "trade_side",
+    "symbol",
+    "qty",
+    "entry_price",
+    "tp_orderId",
+    "sl_price",
+    "sl_algoId",
+    "hold_minutes",
+    "close_due_timestamp",
+    "take_pct",
+    "stop_pct",
+]
+symbol_filters_cache = {
+    LONG_SYMBOL: None,
+    SHORT_SYMBOL: None,
+}
+open_trades_df = None
+binance_time_offset_ms = 0
+account_balance_usdt = 0.0
+last_balance_update_ts = 0.0
+def ensure_open_trades_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in OPEN_TRADE_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NA
+    return out[OPEN_TRADE_COLUMNS]
+def load_open_trades() -> pd.DataFrame:
+    if not os.path.exists(OPEN_TRADES_LOG):
+        return pd.DataFrame(columns=OPEN_TRADE_COLUMNS)
+    try:
+        df = pd.read_csv(OPEN_TRADES_LOG, dtype=str)
+        if df.empty or len(df.columns) == 0:
+            raise ValueError("Empty file")
+        return ensure_open_trades_columns(df)
+    except Exception:
+        print("open_trades_log поврежден или пуст")
+        return pd.DataFrame(columns=OPEN_TRADE_COLUMNS)
+open_trades_df = load_open_trades()
+def fetch_total_balance() -> float:    
+    global account_balance_usdt, last_balance_update_ts
+    try:
+        assets = client.futures_account_balance()
+        total = 0.0
+        for a in assets:
+            if a["asset"] in ("USDT", "USDC"):
+                total += float(a["balance"])
+        account_balance_usdt = total
+        last_balance_update_ts = time.time()
+        print(f"Balance updated: {account_balance_usdt:.2f} USDT+USDC")
+        return total
+    except Exception as exc:
+        print(f"Balance fetch error: {exc}")
+        return account_balance_usdt 
+def get_balance_cached() -> float:    
+    if time.time() - last_balance_update_ts > BALANCE_UPDATE_INTERVAL_SEC:
+        return fetch_total_balance()
+    return account_balance_usdt
+def get_symbol_by_side(signal_side: str) -> str:
+    side = str(signal_side).strip().upper()
+    if side == "LONG":
+        return LONG_SYMBOL
+    if side == "SHORT":
+        return SHORT_SYMBOL
+    raise ValueError(f"Unknown signal side: {signal_side}")
+def get_account_headers() -> dict[str, str]:
+    return {"X-MBX-APIKEY": API_KEY}
+def sign_query(params: dict) -> str:
+    query = "&".join(f"{key}={params[key]}" for key in params)
+    signature = hmac.new(API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    return f"{query}&signature={signature}"
+def sync_binance_time() -> bool:
+    global binance_time_offset_ms
+    try:
+        local_before = int(time.time() * 1000)
+        resp = requests.get(f"{BASE_URL}/fapi/v1/time", timeout=30)
+        data = resp.json()
+        local_after = int(time.time() * 1000)
+        server_time = int(data["serverTime"])
+        local_midpoint = (local_before + local_after) // 2
+        binance_time_offset_ms = server_time - local_midpoint
+        client.timestamp_offset = binance_time_offset_ms
+        print(f"Binance time synced, offset={binance_time_offset_ms}ms")
+        return True
+    except Exception as exc:
+        print(f"Binance time sync error: {exc}")
+        return False
+def signed_request(method: str, path: str, params: dict | None = None, timeout: int = 20):
+    params = dict(params or {})
+    params.setdefault("recvWindow", API_RECV_WINDOW_MS)
+    for attempt in range(2):
+        params["timestamp"] = int(time.time() * 1000)
+        query = sign_query(params)
+        url = f"{BASE_URL}{path}?{query}"
+        resp = requests.request(method, url, headers=get_account_headers(), timeout=timeout)
+        try:
+            data = resp.json()
+        except Exception as exc:
+            raise RuntimeError(f"{path} non-json response: {resp.text}") from exc
+        if isinstance(data, dict) and data.get("code") == -1021 and attempt == 0:
+            print("Timestamp out of recvWindow, syncing Binance time and retrying")
+            sync_binance_time()
+            continue
+        response_code = data.get("code") if isinstance(data, dict) else None
+        success_code = str(response_code) == "200"
+        if resp.status_code >= 400 or (response_code and not success_code):
+            raise RuntimeError(f"{path} error: {data}")
+        return data
+    raise RuntimeError(f"{path} request failed after timestamp retry")
+def get_symbol_filters(symbol: str) -> dict:
+    global symbol_filters_cache
+    if symbol_filters_cache.get(symbol) is not None:
+        return symbol_filters_cache[symbol]
+    info = client.futures_exchange_info()
+    for item in info["symbols"]:
+        if item["symbol"] == symbol:
+            symbol_filters_cache[symbol] = {f["filterType"]: f for f in item["filters"]}
+            return symbol_filters_cache[symbol]
+    raise RuntimeError(f"Could not find filters for {symbol}")
+def round_step_size(qty: float, symbol: str) -> float:
+    filters = get_symbol_filters(symbol)
+    step = Decimal(filters["LOT_SIZE"]["stepSize"])
+    return float((Decimal(str(qty)) // step) * step)
+def round_tick_size(price: float, symbol: str) -> float:
+    filters = get_symbol_filters(symbol)
+    tick = Decimal(filters["PRICE_FILTER"]["tickSize"])
+    return float((Decimal(str(price)) // tick) * tick)
+def is_fresh_signal(signal_timestamp_str: str) -> bool:
+    try:
+        signal_ts = pd.Timestamp(signal_timestamp_str)
+        if signal_ts.tzinfo is None:
+            signal_ts = signal_ts.tz_localize("UTC")
+        else:
+            signal_ts = signal_ts.tz_convert("UTC")
+        now_ts = pd.Timestamp.now(tz="UTC")
+        age_sec = (now_ts - signal_ts).total_seconds()
+        if age_sec < 0:
+            print(f"Signal from the future, skip: {signal_ts}")
+            return False
+        if age_sec <= MAX_SIGNAL_AGE_SECONDS:
+            return True
+        print(f"Signal too old ({age_sec:.1f}s), skip: {signal_ts}")
+        return False
+    except Exception as exc:
+        print(f"Could not parse signal timestamp {signal_timestamp_str}: {exc}")
+        return False
+def get_open_algo_orders(symbol: str) -> list | None:
+    try:
+        return signed_request(
+            "GET",
+            "/fapi/v1/openAlgoOrders",
+            {"symbol": symbol},
+            timeout=20,
+        )
+    except Exception as exc:
+        print(f"openAlgoOrders fetch error [{symbol}]: {exc}")
+        return None
+def cancel_algo_order(algo_id) -> bool:
+    try:
+        signed_request("DELETE", "/fapi/v1/algoOrder", {"algoId": algo_id}, timeout=20)
+        return True
+    except Exception as exc:
+        print(f"cancelAlgoOrder error: {exc}")
+        return False
+def cancel_order(order_id, symbol: str) -> bool:
+    try:
+        signed_request("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}, timeout=20)
+        return True
+    except Exception as exc:
+        print(f"cancelOrder error: {exc}")
+        return False
+def close_qty_market(trade_side: str, qty: float, symbol: str, reason: str, pattern_rank=None) -> bool:
+    _, exit_side = get_order_sides(trade_side)
+    qty = round_step_size(float(qty), symbol)
+    if qty <= 0:
+        print(f"Skip market close with zero qty for pattern={pattern_rank}")
+        return False
+    try:
+        client.futures_create_order(
+            symbol=symbol,
+            side=exit_side,
+            type=FUTURE_ORDER_TYPE_MARKET,
+            quantity=qty,
+            reduceOnly="true",
+        )
+        print(
+            f"Closed {trade_side} for {symbol} by {reason} "
+            f"pattern={pattern_rank} qty={qty}"
+        )
+        return True
+    except Exception as exc:
+        print(f"Market close error for {symbol} pattern={pattern_rank}: {exc}")
+        return False
+def close_trade_market(row: pd.Series, reason: str) -> bool:
+    trade_side = str(row["trade_side"]).strip().upper()
+    symbol = str(row["symbol"])
+    return close_qty_market(trade_side, row["qty"], symbol, reason, row.get("pattern_rank"))
+def enforce_hold_closures():
+    global open_trades_df
+    if open_trades_df.empty:
+        return
+    now_ts = pd.Timestamp.now(tz="UTC")
+    remaining_rows = []
+    for _, row in open_trades_df.iterrows():
+        due_raw = row.get("close_due_timestamp")
+        if pd.isna(due_raw):
+            remaining_rows.append(row)
+            continue
+        due_ts = pd.Timestamp(due_raw)
+        if due_ts.tzinfo is None:
+            due_ts = due_ts.tz_localize("UTC")
+        else:
+            due_ts = due_ts.tz_convert("UTC")
+
+        if due_ts > now_ts:
+            remaining_rows.append(row)
+            continue
+        tp_order_id = row.get("tp_orderId")
+        sl_algo_id = row.get("sl_algoId")
+        symbol = str(row["symbol"])
+        if not close_trade_market(row, "hold_minutes"):
+            remaining_rows.append(row)
+            continue
+        if pd.notna(tp_order_id):
+            if not cancel_order(int(tp_order_id), symbol):
+                print(f"TP cancel after timed close failed for {symbol}")
+        if pd.notna(sl_algo_id):
+            if not cancel_algo_order(sl_algo_id):
+                print(f"SL cancel after timed close failed for {symbol}")
+    open_trades_df = ensure_open_trades_columns(pd.DataFrame(remaining_rows))
+    open_trades_df.to_csv(OPEN_TRADES_LOG, index=False)
+def update_open_trades_log_by_price():
+    global open_trades_df
+    if open_trades_df.empty:
+        return
+    updated_rows = []
+    for _, row in open_trades_df.iterrows():
+        symbol = str(row["symbol"])
+        try:
+            tp_orders = client.futures_get_open_orders(symbol=symbol)
+        except Exception as exc:
+            if "-1021" in str(exc):
+                print(f"Timestamp error for {symbol}, syncing time and retrying...")
+                sync_binance_time()
+                try:
+                    tp_orders = client.futures_get_open_orders(symbol=symbol)
+                except Exception as exc2:
+                    print(f"Order fetch error after resync [{symbol}]: {exc2}")
+                    updated_rows.append(row)
+                    continue
+            else:
+                print(f"Order fetch error for {symbol}: {exc}")
+                updated_rows.append(row)
+                continue
+        algo_orders = get_open_algo_orders(symbol)
+        if algo_orders is None:
+            updated_rows.append(row)
+            continue
+        entry_price = row["entry_price"]
+        tp_order_id = row["tp_orderId"]
+        sl_algo_id = row.get("sl_algoId")
+
+        if pd.isna(tp_order_id) or pd.isna(sl_algo_id):
+            print(f"Missing TP/SL ids for entry {entry_price} [{symbol}], retry create")
+            trade_side = str(row["trade_side"]).strip().upper()
+            _, exit_side = get_order_sides(trade_side)
+            tp_price, computed_sl_price = build_exit_prices(
+                float(entry_price),
+                trade_side,
+                float(row["take_pct"]),
+                float(row["stop_pct"]),
+                symbol,
+            )
+            sl_price = float(row["sl_price"]) if pd.notna(row.get("sl_price")) else computed_sl_price
+            existing_tp_order_id = None if pd.isna(tp_order_id) else int(tp_order_id)
+            existing_sl_algo_id = None if pd.isna(sl_algo_id) else str(sl_algo_id)
+            new_tp_order_id, new_sl_algo_id, protection_confirmed = create_exit_orders_with_retry(
+                exit_side,
+                float(row["qty"]),
+                tp_price,
+                sl_price,
+                symbol,
+                tp_order_id=existing_tp_order_id,
+                sl_algo_id=existing_sl_algo_id,
+            )
+            if not protection_confirmed:
+                print(f"TP/SL still not fully confirmed for entry {entry_price} [{symbol}]")
+            row = row.copy()
+            row["tp_orderId"] = new_tp_order_id
+            row["sl_algoId"] = new_sl_algo_id
+            row["sl_price"] = sl_price
+            updated_rows.append(row)
+            continue
+        tp_active = any(str(o["orderId"]) == str(tp_order_id) for o in tp_orders)
+        sl_active = any(str(o["algoId"]) == str(sl_algo_id) for o in algo_orders)
+        if not tp_active and sl_active:
+            if cancel_algo_order(sl_algo_id):
+                print(f"TP disappeared -> SL cancelled for entry {entry_price} [{symbol}]")
+                continue
+            print(f"Could not cancel SL for entry {entry_price} [{symbol}], keep trade in log")
+            updated_rows.append(row)
+            continue
+        if tp_active and not sl_active:
+            if cancel_order(tp_order_id, symbol):
+                print(f"SL disappeared -> TP cancelled for entry {entry_price} [{symbol}]")
+                continue
+            print(f"Could not cancel TP for entry {entry_price} [{symbol}], keep trade in log")
+            updated_rows.append(row)
+            continue
+        if tp_active and sl_active:
+            updated_rows.append(row)
+        else:
+            print(f"Both TP and SL are gone for entry {entry_price} [{symbol}], remove from log")
+    open_trades_df = ensure_open_trades_columns(pd.DataFrame(updated_rows))
+    open_trades_df.to_csv(OPEN_TRADES_LOG, index=False)
+def build_exit_prices(entry_price: float, trade_side: str, take_pct: float, stop_pct: float, symbol: str) -> tuple[float, float]:
+    take_fraction = take_pct / 100.0
+    stop_fraction = stop_pct / 100.0
+    if trade_side == "LONG":
+        tp_price = round_tick_size(entry_price * (1.0 + take_fraction), symbol)
+        sl_price = round_tick_size(entry_price * (1.0 - stop_fraction), symbol)
+    else:
+        tp_price = round_tick_size(entry_price * (1.0 - take_fraction), symbol)
+        sl_price = round_tick_size(entry_price * (1.0 + stop_fraction), symbol)
+    return tp_price, sl_price
+def get_order_sides(trade_side: str) -> tuple[str, str]:
+    if trade_side == "LONG":
+        return SIDE_BUY, SIDE_SELL
+    if trade_side == "SHORT":
+        return SIDE_SELL, SIDE_BUY
+    raise ValueError(f"Unknown trade side: {trade_side}")
+def get_entry_price_from_order(order_id, symbol: str, fallback_price: float) -> float:
+    try:
+        trades = client.futures_account_trades(symbol=symbol)
+        order_trades = [t for t in trades if str(t.get("orderId")) == str(order_id)]
+        if order_trades:
+            total_qty = sum(float(t["qty"]) for t in order_trades)
+            if total_qty > 0:
+                total_quote = sum(float(t["price"]) * float(t["qty"]) for t in order_trades)
+                return total_quote / total_qty
+        if trades:
+            return float(trades[-1]["price"])
+    except Exception as exc:
+        print(f"Entry price fetch error, use ticker fallback: {exc}")
+    return fallback_price
+def create_sl_order(exit_side: str, qty: float, sl_trigger_price: float, symbol: str) -> str | None:
+    sl_params = {
+        "algoType": "CONDITIONAL",
+        "symbol": symbol,
+        "side": exit_side,
+        "type": "STOP_MARKET",
+        "quantity": qty,
+        "triggerPrice": sl_trigger_price,
+        "workingType": WORKING_TYPE,
+        "priceProtect": "TRUE",
+        "reduceOnly": "false",
+    }
+    try:
+        sl_data = signed_request("POST", "/fapi/v1/algoOrder", sl_params, timeout=20)
+    except Exception as exc:
+        print("SL order creation error:", exc)
+        return None
+    if not isinstance(sl_data, dict) or "algoId" not in sl_data:
+        print("SL order creation error:", sl_data)
+        return None
+    return str(sl_data["algoId"])
+def create_tp_order(exit_side: str, qty: float, tp_price: float, symbol: str) -> int | None:
+    tp_params = {
+        "symbol": symbol,
+        "side": exit_side,
+        "type": "LIMIT",
+        "quantity": qty,
+        "price": tp_price,
+        "timeInForce": "GTC",
+        "reduceOnly": "false",
+    }
+    try:
+        tp_data = signed_request("POST", "/fapi/v1/order", tp_params, timeout=20)
+    except Exception as exc:
+        print("TP order creation error:", exc)
+        return None
+    if not isinstance(tp_data, dict) or "orderId" not in tp_data:
+        print("TP order creation error:", tp_data)
+        return None
+    return int(tp_data["orderId"])
+def verify_exit_orders(tp_order_id, sl_algo_id, symbol: str) -> tuple[bool | None, bool | None]:
+    try:
+        tp_orders = client.futures_get_open_orders(symbol=symbol)
+    except Exception as exc:
+        print(f"TP verify error [{symbol}]: {exc}")
+        tp_active = None
+    else:
+        tp_active = any(str(o["orderId"]) == str(tp_order_id) for o in tp_orders) if tp_order_id else False
+    algo_orders = get_open_algo_orders(symbol)
+    if algo_orders is None:
+        sl_active = None
+    else:
+        sl_active = any(str(o["algoId"]) == str(sl_algo_id) for o in algo_orders) if sl_algo_id else False
+    return tp_active, sl_active
+def create_exit_orders_with_retry(
+    exit_side: str,
+    qty: float,
+    tp_price: float,
+    sl_trigger_price: float,
+    symbol: str,
+    tp_order_id=None,
+    sl_algo_id=None,
+) -> tuple[int | None, str | None, bool]:
+    for attempt in range(1, EXIT_ORDER_RETRIES + 1):
+        if not sl_algo_id:
+            time.sleep(EXIT_ORDER_DELAY_SECONDS)
+            sl_algo_id = create_sl_order(exit_side, qty, sl_trigger_price, symbol)
+            if sl_algo_id:
+                print(f"SL created algoId={sl_algo_id} attempt={attempt}")
+        if not tp_order_id:
+            time.sleep(EXIT_ORDER_DELAY_SECONDS)
+            tp_order_id = create_tp_order(exit_side, qty, tp_price, symbol)
+            if tp_order_id:
+                print(f"TP created orderId={tp_order_id} attempt={attempt}")
+        time.sleep(EXIT_ORDER_DELAY_SECONDS)
+        tp_active, sl_active = verify_exit_orders(tp_order_id, sl_algo_id, symbol)
+        if tp_active and sl_active:
+            return tp_order_id, sl_algo_id, True
+        if tp_active is False:
+            print(f"TP not active after create, retry attempt={attempt}")
+            tp_order_id = None
+        if sl_active is False:
+            print(f"SL not active after create, retry attempt={attempt}")
+            sl_algo_id = None
+        if tp_active is None or sl_active is None:
+            print(f"Exit order verify unavailable, retry attempt={attempt}")
+        if attempt < EXIT_ORDER_RETRIES:
+            time.sleep(EXIT_ORDER_DELAY_SECONDS)
+    print(
+        "Exit orders not fully confirmed after retries: "
+        f"tp_orderId={tp_order_id} sl_algoId={sl_algo_id}"
+    )
+    return tp_order_id, sl_algo_id, False
+def open_trade(signal: dict):
+    global open_trades_df
+    update_open_trades_log_by_price()
+    if len(open_trades_df) >= MAX_OPEN_TRADES:
+        print("Trade limit reached")
+        return
+    trade_side = str(signal["side"]).strip().upper()
+    symbol = get_symbol_by_side(trade_side)
+    entry_side, exit_side = get_order_sides(trade_side)
+    take_pct = float(signal["take_pct"])
+    stop_pct = float(signal["stop_pct"])
+    hold_minutes = int(float(signal["hold_minutes"]))   
+    price = float(client.futures_symbol_ticker(symbol=symbol)["price"])    
+    balance = get_balance_cached()
+    if balance <= 0:
+        print("Balance is zero or unavailable, skipping trade")
+        return
+    risk_usdt = balance * (RISK_PER_TRADE_PCT / 100.0)
+    qty_from_risk = risk_usdt / (price * stop_pct / 100.0)    
+    qty = round_step_size(max(qty_from_risk, MIN_QTY_BTC), symbol)
+    if qty == 0:
+        print("qty too small")
+        return
+    print(
+        f"Balance={balance:.2f} USDT+USDC, "
+        f"risk={risk_usdt:.2f} USDT ({RISK_PER_TRADE_PCT}%), "
+        f"stop_pct={stop_pct}%, "
+        f"qty_from_risk={qty_from_risk:.4f} BTC, "
+        f"qty_final={qty} BTC (min={MIN_QTY_BTC})"
+    )
+    client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
+    entry_order = client.futures_create_order(
+        symbol=symbol,
+        side=entry_side,
+        type=FUTURE_ORDER_TYPE_MARKET,
+        quantity=qty,
+    )
+    time.sleep(EXIT_ORDER_DELAY_SECONDS)
+    entry_order_id = entry_order.get("orderId") if isinstance(entry_order, dict) else None
+    entry_price = get_entry_price_from_order(entry_order_id, symbol, price)
+    tp_price, sl_trigger_price = build_exit_prices(entry_price, trade_side, take_pct, stop_pct, symbol)
+    print(f"Entry confirmed price={entry_price}, create SL then TP")
+    tp_order_id, sl_algo_id, protection_confirmed = create_exit_orders_with_retry(
+        exit_side,
+        qty,
+        tp_price,
+        sl_trigger_price,
+        symbol,
+    )
+    new_row = {
+        "timestamp": pd.Timestamp.now(tz="UTC"),
+        "signal_timestamp": signal["timestamp"],
+        "pattern_rank": signal["pattern_rank"],
+        "pattern_name": signal["pattern_name"],
+        "trade_side": trade_side,
+        "symbol": symbol,
+        "qty": qty,
+        "entry_price": entry_price,
+        "tp_orderId": tp_order_id,
+        "sl_price": sl_trigger_price,
+        "sl_algoId": sl_algo_id,
+        "hold_minutes": hold_minutes,
+        "close_due_timestamp": pd.Timestamp.now(tz="UTC") + timedelta(minutes=hold_minutes),
+        "take_pct": take_pct,
+        "stop_pct": stop_pct,
+    }
+    new_row_df = pd.DataFrame([new_row])
+    if open_trades_df.empty:
+        open_trades_df = new_row_df
+    else:
+        open_trades_df = pd.concat([open_trades_df, new_row_df], ignore_index=True)
+    open_trades_df = ensure_open_trades_columns(open_trades_df)
+    open_trades_df.to_csv(OPEN_TRADES_LOG, index=False)
+    protection_status = "confirmed" if protection_confirmed else "partial_retry_in_loop"
+    print(
+        f"Opened {trade_side} for {symbol} "
+        f"pattern={signal['pattern_rank']} "
+        f"entry={entry_price} tp={tp_price} sl={sl_trigger_price} "
+        f"protection={protection_status}"
+    )
+def parse_signal_row(raw_row: list[str]) -> dict:
+    if len(raw_row) < len(SIGNAL_FIELDS):
+        raise ValueError(f"Incomplete signal row: expected {len(SIGNAL_FIELDS)} fields, got {len(raw_row)}")
+    signal = dict(zip(SIGNAL_FIELDS, raw_row))
+    return signal
+class TradesHandler(FileSystemEventHandler):
+    def __init__(self, file_path: str):
+        super().__init__()
+        self.file_path = file_path
+        if os.path.exists(self.file_path):
+            with open(self.file_path, "r", encoding="utf-8") as file:
+                file.seek(0, os.SEEK_END)
+                self.last_position = file.tell()
+        else:
+            self.last_position = 0
+    def on_modified(self, event):
+        if not event.src_path.endswith(self.file_path):
+            return
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as file:
+                file.seek(self.last_position)
+                lines = file.readlines()
+                self.last_position = file.tell()
+            for line in lines:
+                if line.startswith("timestamp") or not line.strip():
+                    continue
+                try:
+                    raw_row = next(csv.reader([line]))
+                    signal = parse_signal_row(raw_row)
+                    if not is_fresh_signal(signal["timestamp"]):
+                        continue
+                except Exception as exc:
+                    print(f"Signal parse error: {exc}")
+                    continue
+                print(
+                    f"New fresh signal ({signal['timestamp']}) -> "
+                    f"{signal['side']} rank={signal['pattern_rank']}"
+                )
+                open_trade(signal)
+        except Exception as exc:
+            print("Signal handling error:", exc)
+if __name__ == "__main__":
+    print("Watchdog started")
+    sync_binance_time()    
+    fetch_total_balance()
+    print(client.futures_symbol_ticker(symbol=LONG_SYMBOL))
+    observer = Observer()
+    handler = TradesHandler(TRADES_FILE)
+    observer.schedule(handler, path=".", recursive=False)
+    observer.start()
+    last_time_sync_ts = time.time()
+    TIME_SYNC_INTERVAL_SEC = 3600  
+    try:
+        while True:            
+            if time.time() - last_time_sync_ts > TIME_SYNC_INTERVAL_SEC:
+                sync_binance_time()
+                last_time_sync_ts = time.time()            
+            get_balance_cached()
+            enforce_hold_closures()
+            update_open_trades_log_by_price()
+            time.sleep(60)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
